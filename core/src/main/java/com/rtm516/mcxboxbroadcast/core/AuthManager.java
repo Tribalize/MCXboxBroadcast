@@ -18,6 +18,7 @@ import net.raphimc.minecraftauth.util.holder.listener.BasicChangeListener;
 import net.raphimc.minecraftauth.util.http.exception.InformativeHttpRequestException;
 
 import java.io.IOException;
+import java.util.Locale;
 import java.util.function.Consumer;
 
 public class AuthManager {
@@ -27,6 +28,7 @@ public class AuthManager {
 
     private BedrockAuthManager authManager;
     private Runnable onDeviceTokenRefreshCallback;
+    private boolean recoveredExpiredGrant;
 
     private final Holder<CachedProfileInfo> profileInfo;
 
@@ -87,14 +89,7 @@ public class AuthManager {
         try {
             // Login if not already loaded
             if (authManager == null) {
-                // Explicitly define the callback to assist type inference for the generic T
-                Consumer<MsaDeviceCode> deviceCodeCallback = msaDeviceCode -> {
-                    logger.info("To sign in, use a web browser to open the page " + msaDeviceCode.getVerificationUri() + " and enter the code " + msaDeviceCode.getUserCode() + " to authenticate.");
-                    notificationManager.sendSessionExpiredNotification(msaDeviceCode.getVerificationUri(), msaDeviceCode.getUserCode());
-                };
-
-                authManager = BedrockAuthManager.create(httpClient, Constants.BEDROCK_CODEC.getMinecraftVersion())
-                        .login(DeviceCodeMsaAuthService::new, deviceCodeCallback);
+                loginWithDeviceCode(httpClient);
             }
 
             // Ensure tokens are fresh
@@ -116,8 +111,65 @@ public class AuthManager {
                 return;
             }
 
+            if (isExpiredGrant(e)) {
+                recoverExpiredGrant(httpClient, e);
+                return;
+            }
+
             logger.error("Failed to get/refresh auth token", e);
         }
+    }
+
+    private void loginWithDeviceCode(HttpClient httpClient) throws Exception {
+        // Explicitly define the callback to assist type inference for the generic T
+        Consumer<MsaDeviceCode> deviceCodeCallback = msaDeviceCode -> {
+            logger.info("To sign in, use a web browser to open the page " + msaDeviceCode.getVerificationUri() + " and enter the code " + msaDeviceCode.getUserCode() + " to authenticate.");
+            notificationManager.sendSessionExpiredNotification(msaDeviceCode.getVerificationUri(), msaDeviceCode.getUserCode());
+        };
+
+        authManager = BedrockAuthManager.create(httpClient, Constants.BEDROCK_CODEC.getMinecraftVersion())
+                .login(DeviceCodeMsaAuthService::new, deviceCodeCallback);
+    }
+
+    private void recoverExpiredGrant(HttpClient httpClient, Exception originalError) {
+        logger.warn("Re-auth required: saved Microsoft/Xbox login expired. Sign in again to continue.");
+
+        authManager = null;
+        try {
+            storageManager.cache("");
+        } catch (IOException e) {
+            logger.error("Failed to clear expired auth cache", e);
+        }
+
+        try {
+            loginWithDeviceCode(httpClient);
+            refreshTokens();
+            authManager.getChangeListeners().add((BasicChangeListener) this::saveToCache);
+            saveToCache();
+
+            if (onDeviceTokenRefreshCallback != null) {
+                authManager.getXblDeviceToken().getChangeListeners().add((BasicChangeListener) onDeviceTokenRefreshCallback::run);
+            }
+
+            recoveredExpiredGrant = true;
+        } catch (Exception e) {
+            logger.error("Failed to re-authorize Xbox account after expired login", e);
+            logger.debug("Original expired login error: " + originalError.getMessage());
+        }
+    }
+
+    private boolean isExpiredGrant(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            String message = String.valueOf(current.getMessage()).toLowerCase(Locale.ROOT);
+            if (message.contains("invalid_grant")
+                    || message.contains("grant is expired")
+                    || message.contains("must sign in again")) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     private void refreshTokens() throws IOException, AgeVerificationException {
@@ -163,6 +215,12 @@ public class AuthManager {
             initialise();
         }
         return authManager;
+    }
+
+    public boolean consumeRecoveredExpiredGrant() {
+        boolean recovered = recoveredExpiredGrant;
+        recoveredExpiredGrant = false;
+        return recovered;
     }
 
     public String getPlayfabSessionTicket() {

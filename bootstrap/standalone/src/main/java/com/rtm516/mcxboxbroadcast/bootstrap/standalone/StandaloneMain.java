@@ -91,6 +91,12 @@ public class StandaloneMain {
             return;
         }
 
+        if (sessionManager.consumeAuthRecoveryFlag()) {
+            logger.info("Re-auth completed; restarting session to refresh NetherNet...");
+            restart();
+            return;
+        }
+
         sessionManager.scheduledThread().scheduleWithFixedDelay(() -> {
             updateSessionInfo(sessionInfo);
 

@@ -143,6 +143,10 @@ public abstract class SessionManagerCore {
         return authManager.getManager();
     }
 
+    public boolean consumeAuthRecoveryFlag() {
+        return authManager.consumeRecoveredExpiredGrant();
+    }
+
     /**
      * Initialize the session manager with the given session information
      *
