@@ -205,6 +205,9 @@ public class AuthManager {
         if (authManager == null) {
             initialise();
         }
+        if (authManager == null) {
+            throw new IllegalStateException("Authentication is unavailable; retry once network access is restored");
+        }
 
         try {
             // Ensure we have fresh tokens
@@ -213,6 +216,9 @@ public class AuthManager {
             logger.error("Failed to refresh tokens", e);
             // Try to re-initialize (force login if refresh failed fatally)
             initialise();
+            if (authManager == null) {
+                throw new IllegalStateException("Authentication refresh failed; retry once network access is restored", e);
+            }
         }
         return authManager;
     }
@@ -224,11 +230,8 @@ public class AuthManager {
     }
 
     public String getPlayfabSessionTicket() {
-        if (authManager == null) {
-            initialise();
-        }
         try {
-            return authManager.getPlayFabToken().getUpToDate().getSessionTicket();
+            return getManager().getPlayFabToken().getUpToDate().getSessionTicket();
         } catch (IOException e) {
             logger.error("Failed to get PlayFab session ticket", e);
             return null;
@@ -253,7 +256,8 @@ public class AuthManager {
      * @return The Gamertag of the current user
      */
     public String getGamertag() {
-        return profileInfo.getCached().gamertag();
+        CachedProfileInfo cachedProfileInfo = profileInfo.getCached();
+        return cachedProfileInfo != null ? cachedProfileInfo.gamertag() : "";
     }
 
     /**
@@ -262,6 +266,7 @@ public class AuthManager {
      * @return The XUID of the current user
      */
     public String getXuid() {
-        return profileInfo.getCached().xuid();
+        CachedProfileInfo cachedProfileInfo = profileInfo.getCached();
+        return cachedProfileInfo != null ? cachedProfileInfo.xuid() : "";
     }
 }

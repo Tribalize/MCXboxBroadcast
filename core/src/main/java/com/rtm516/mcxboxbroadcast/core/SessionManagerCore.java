@@ -28,6 +28,7 @@ import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.lang.reflect.Field;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -380,18 +381,42 @@ public abstract class SessionManagerCore {
     protected void checkConnection() {
         boolean rtaIsOpen = this.rtaWebsocket != null && this.rtaWebsocket.isOpen();
         boolean rtcIsOpen = this.netherNetChannel != null && this.netherNetChannel.isOpen();
+        boolean signalingIsOpen = signalingIsOpen();
 
         // Check if the connection is Lost
-        if (!rtaIsOpen || !rtcIsOpen) {
+        if (!rtaIsOpen || !rtcIsOpen || !signalingIsOpen) {
             try {
                 logger.warn("Connection to websocket lost, re-creating session...");
-                logger.debug("WebSocket status: RTA Open: " + rtaIsOpen + " RTC Open: " + rtcIsOpen);
+                logger.debug("WebSocket status: RTA Open: " + rtaIsOpen + " RTC Open: " + rtcIsOpen + " Signaling Open: " + signalingIsOpen);
 
                 createSession();
                 logger.info("WebSocket session reconnected");
-            } catch (SessionCreationException | SessionUpdateException e) {
+            } catch (SessionCreationException | SessionUpdateException | RuntimeException e) {
                 logger.error("Session is dead and hit exception trying to re-create it", e);
             }
+        }
+    }
+
+    /**
+     * Check the Xbox RPC signaling socket as well as the local NetherNet listener.
+     * The local listener can remain open after the remote signaling socket resets.
+     */
+    private boolean signalingIsOpen() {
+        if (signaling == null) {
+            return false;
+        }
+
+        try {
+            Field channelField = Class.forName(
+                "dev.kastle.netty.channel.nethernet.signaling.AbstractNetherNetXboxSignaling"
+            ).getDeclaredField("channel");
+            channelField.setAccessible(true);
+            Object channel = channelField.get(signaling);
+            return channel instanceof Channel && ((Channel) channel).isOpen();
+        } catch (ReflectiveOperationException | SecurityException e) {
+            // Do not force reconnects if a future NetherNet transport changes this internals.
+            logger.debug("Unable to inspect NetherNet signaling channel; using local channel state", e);
+            return true;
         }
     }
 

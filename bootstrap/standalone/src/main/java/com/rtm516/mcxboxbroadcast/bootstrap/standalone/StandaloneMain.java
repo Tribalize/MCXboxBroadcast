@@ -20,8 +20,11 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class StandaloneMain {
+    private static final int RECOVERY_RETRY_SECONDS = Integer.getInteger("recovery.retry.seconds", 30);
+    private static final AtomicBoolean RECOVERY_RETRY_SCHEDULED = new AtomicBoolean(false);
     private static CoreConfig config;
     private static StandaloneLoggerImpl logger;
     private static SessionInfo sessionInfo;
@@ -64,23 +67,41 @@ public class StandaloneMain {
         // Sync the session info from the server if needed
         updateSessionInfo(sessionInfo);
 
-        createSession();
-
         logger.start();
+        startSessionOrScheduleRecovery();
     }
 
     public static void restart() {
-        try {
+        if (sessionManager != null) {
             sessionManager.shutdown();
-
-            // Create a new session manager, but reuse the notification manager as config hasn't been reloaded
-            sessionManager = new SessionManager(new FileStorageManager("./cache", "./screenshot.jpg"), notificationManager, logger);
-            sessionManager.setNetherNetPortRange(config.session().icePortRange().min(), config.session().icePortRange().max());
-
-            createSession();
-        } catch (SessionCreationException | SessionUpdateException e) {
-            logger.error("Failed to restart session", e);
         }
+
+        // Create a new session manager, but reuse the notification manager as config hasn't been reloaded
+        sessionManager = new SessionManager(new FileStorageManager("./cache", "./screenshot.jpg"), notificationManager, logger);
+        sessionManager.setNetherNetPortRange(config.session().icePortRange().min(), config.session().icePortRange().max());
+
+        startSessionOrScheduleRecovery();
+    }
+
+    private static void startSessionOrScheduleRecovery() {
+        try {
+            createSession();
+        } catch (SessionCreationException | SessionUpdateException | RuntimeException e) {
+            logger.error("Failed to create session; retrying after network recovery", e);
+            scheduleRecoveryRetry();
+        }
+    }
+
+    private static void scheduleRecoveryRetry() {
+        if (!RECOVERY_RETRY_SCHEDULED.compareAndSet(false, true)) {
+            return;
+        }
+
+        logger.warn("Session recovery will retry in " + RECOVERY_RETRY_SECONDS + " seconds");
+        sessionManager.scheduledThread().schedule(() -> {
+            RECOVERY_RETRY_SCHEDULED.set(false);
+            restart();
+        }, RECOVERY_RETRY_SECONDS, TimeUnit.SECONDS);
     }
 
     private static void createSession() throws SessionCreationException, SessionUpdateException {
