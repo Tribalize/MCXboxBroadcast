@@ -415,7 +415,7 @@ public abstract class SessionManagerCore {
             return channel instanceof Channel && ((Channel) channel).isOpen();
         } catch (ReflectiveOperationException | SecurityException e) {
             // Do not force reconnects if a future NetherNet transport changes this internals.
-            logger.debug("Unable to inspect NetherNet signaling channel; using local channel state", e);
+            logger.debug("Unable to inspect NetherNet signaling channel; using local channel state: " + logger.getStackTrace(e));
             return true;
         }
     }
