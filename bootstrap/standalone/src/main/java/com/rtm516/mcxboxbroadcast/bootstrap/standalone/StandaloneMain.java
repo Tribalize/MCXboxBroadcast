@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class StandaloneMain {
     private static final int RECOVERY_RETRY_SECONDS = Integer.getInteger("recovery.retry.seconds", 30);
+    private static final int SERVER_QUERY_TIMEOUT_SECONDS = Integer.getInteger("server.query.timeout.seconds", 5);
     private static final AtomicBoolean RECOVERY_RETRY_SCHEDULED = new AtomicBoolean(false);
     private static CoreConfig config;
     private static StandaloneLoggerImpl logger;
@@ -64,10 +65,12 @@ public class StandaloneMain {
 
         PingUtil.setWebPingEnabled(config.session().webQueryFallback());
 
-        // Sync the session info from the server if needed
+        logger.start();
+
+        // Start logging before probing the server so a failed or stalled probe
+        // cannot hide the authentication prompt or its error.
         updateSessionInfo(sessionInfo);
 
-        logger.start();
         startSessionOrScheduleRecovery();
     }
 
@@ -141,7 +144,9 @@ public class StandaloneMain {
         if (config.session().queryServer()) {
             try {
                 InetSocketAddress addressToPing = new InetSocketAddress(sessionInfo.getIp(), sessionInfo.getPort());
-                BedrockPong pong = PingUtil.ping(addressToPing, 1500, TimeUnit.MILLISECONDS).get();
+                logger.info("Querying Bedrock server at " + addressToPing + "...");
+                BedrockPong pong = PingUtil.ping(addressToPing, 1500, TimeUnit.MILLISECONDS)
+                    .get(SERVER_QUERY_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
                 // Update the session information
                 sessionInfo.setHostName(pong.subMotd());
@@ -153,23 +158,30 @@ public class StandaloneMain {
                 if (sessionInfo.getHostName().isEmpty()) {
                     sessionInfo.setHostName(sessionManager.getGamertag());
                 }
-            } catch (InterruptedException | ExecutionException e) {
-                if (config.session().configFallback()) {
-                    sessionManager.logger().error("Failed to ping server, falling back to config values", e);
-
-                    sessionInfo.setHostName(config.session().sessionInfo().hostName());
-                    sessionInfo.setWorldName(config.session().sessionInfo().worldName());
-                    sessionInfo.setPlayers(config.session().sessionInfo().players());
-                    sessionInfo.setMaxPlayers(config.session().sessionInfo().maxPlayers());
-
-                    // Fallback to the gamertag if the host name is empty
-                    if (sessionInfo.getHostName().isEmpty()) {
-                        sessionInfo.setHostName(sessionManager.getGamertag());
-                    }
-                } else {
-                    sessionManager.logger().error("Failed to ping server", e);
-                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                handleServerQueryFailure(sessionInfo, e);
+            } catch (ExecutionException | TimeoutException e) {
+                handleServerQueryFailure(sessionInfo, e);
             }
+        }
+    }
+
+    private static void handleServerQueryFailure(SessionInfo sessionInfo, Exception e) {
+        if (config.session().configFallback()) {
+            sessionManager.logger().error("Failed to ping server, falling back to config values", e);
+
+            sessionInfo.setHostName(config.session().sessionInfo().hostName());
+            sessionInfo.setWorldName(config.session().sessionInfo().worldName());
+            sessionInfo.setPlayers(config.session().sessionInfo().players());
+            sessionInfo.setMaxPlayers(config.session().sessionInfo().maxPlayers());
+
+            // Fallback to the gamertag if the host name is empty
+            if (sessionInfo.getHostName().isEmpty()) {
+                sessionInfo.setHostName(sessionManager.getGamertag());
+            }
+        } else {
+            sessionManager.logger().error("Failed to ping server; continuing with configured session values", e);
         }
     }
 }
