@@ -66,13 +66,10 @@ public class StandaloneMain {
 
         PingUtil.setWebPingEnabled(config.session().webQueryFallback());
 
-        logger.start();
-
-        // Start logging before probing the server so a failed or stalled probe
-        // cannot hide the authentication prompt or its error.
         updateSessionInfo(sessionInfo);
 
         startSessionOrScheduleRecovery();
+        logger.start();
     }
 
     public static void restart() {
