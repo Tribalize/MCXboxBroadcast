@@ -16,7 +16,9 @@ dependencyResolutionManagement {
 }
 
 plugins {
-    id("org.gradle.toolchains.foojay-resolver-convention") version ("0.8.0")
+    // Foojay 0.x directly references JvmVendorSpec.IBM_SEMERU, which Gradle 9
+    // removed. 1.0.0 supports Gradle 9 and is run by this build's JDK 17.
+    id("org.gradle.toolchains.foojay-resolver-convention") version ("1.0.0")
 }
 
 enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
