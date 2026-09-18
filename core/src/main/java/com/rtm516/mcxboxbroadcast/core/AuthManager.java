@@ -3,8 +3,6 @@ package com.rtm516.mcxboxbroadcast.core;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.rtm516.mcxboxbroadcast.core.exceptions.AgeVerificationException;
-import com.rtm516.mcxboxbroadcast.core.models.auth.CachedProfileInfo;
-import com.rtm516.mcxboxbroadcast.core.models.auth.XblUsersMeProfileRequest;
 import com.rtm516.mcxboxbroadcast.core.notifications.NotificationManager;
 import com.rtm516.mcxboxbroadcast.core.storage.StorageManager;
 import net.lenni0451.commons.httpclient.HttpClient;
@@ -13,12 +11,9 @@ import net.raphimc.minecraftauth.bedrock.BedrockAuthManager;
 import net.raphimc.minecraftauth.msa.model.MsaDeviceCode;
 import net.raphimc.minecraftauth.msa.service.impl.DeviceCodeMsaAuthService;
 import net.raphimc.minecraftauth.util.MinecraftAuth4To5Migrator;
-import net.raphimc.minecraftauth.util.holder.Holder;
-import net.raphimc.minecraftauth.util.holder.listener.BasicChangeListener;
 import net.raphimc.minecraftauth.util.http.exception.InformativeHttpRequestException;
 
 import java.io.IOException;
-import java.util.Locale;
 import java.util.function.Consumer;
 
 public class AuthManager {
@@ -28,9 +23,6 @@ public class AuthManager {
 
     private BedrockAuthManager authManager;
     private Runnable onDeviceTokenRefreshCallback;
-    private boolean recoveredExpiredGrant;
-
-    private final Holder<CachedProfileInfo> profileInfo;
 
     /**
      * Create an instance of AuthManager
@@ -45,18 +37,12 @@ public class AuthManager {
         this.logger = logger.prefixed("Auth");
 
         this.authManager = null;
-        this.profileInfo = new Holder<>(() -> {
-            HttpClient httpClient = MinecraftAuth.createHttpClient();
-            XblUsersMeProfileRequest.Response response = httpClient.executeAndHandle(new XblUsersMeProfileRequest(authManager.getXboxLiveXstsToken().getUpToDate()));
-            XblUsersMeProfileRequest.Response.ProfileUser profileUser = response.profileUsers().get(0);
-            return new CachedProfileInfo(profileUser.settings().get("Gamertag"), profileUser.id());
-        });
     }
 
     /**
      * Follow the auth flow to get the Xbox token and store it
      */
-    private void initialise() {
+    private void initialise(boolean isReauth) {
         HttpClient httpClient = MinecraftAuth.createHttpClient();
 
         // Try to load xboxToken from cache.json if is not already loaded
@@ -89,30 +75,50 @@ public class AuthManager {
         try {
             // Login if not already loaded
             if (authManager == null) {
-                loginWithDeviceCode(httpClient);
+                // Explicitly define the callback to assist type inference for the generic T
+                Consumer<MsaDeviceCode> deviceCodeCallback = msaDeviceCode -> {
+                    logger.info("To sign in, use a web browser to open the page " + msaDeviceCode.getVerificationUri() + " and enter the code " + msaDeviceCode.getUserCode() + " to authenticate.");
+                    notificationManager.sendSessionExpiredNotification(msaDeviceCode.getVerificationUri(), msaDeviceCode.getUserCode());
+                };
+
+                authManager = BedrockAuthManager.create(httpClient, Constants.BEDROCK_CODEC.getMinecraftVersion())
+                        .login(DeviceCodeMsaAuthService::new, deviceCodeCallback);
             }
 
             // Ensure tokens are fresh
             refreshTokens();
 
             // Set up listener for saving
-            // Explicitly cast to BasicChangeListener to resolve ambiguity with Runnable
-            authManager.getChangeListeners().add((BasicChangeListener) this::saveToCache);
+            authManager.getChangeListeners().add(this::saveToCache);
             saveToCache();
 
             // Setup device token refresh callback
             if (onDeviceTokenRefreshCallback != null) {
-                authManager.getXblDeviceToken().getChangeListeners().add((BasicChangeListener) onDeviceTokenRefreshCallback::run);
+                authManager.getXblDeviceToken().getChangeListeners().add(onDeviceTokenRefreshCallback::run);
             }
-
         } catch (Exception e) {
             // Dont log age verification errors as they are handled elsewhere
             if (e instanceof AgeVerificationException) {
                 return;
             }
 
-            if (isExpiredGrant(e)) {
-                recoverExpiredGrant(httpClient, e);
+            if (e.getMessage() != null && e.getMessage().contains("invalid_grant")) {
+                if (isReauth) {
+                    // Already cleared cache and re-ran device code, still invalid_grant
+                    logger.error("Re-auth still failed with invalid_grant. Sign in with username and password, not a passwordless method.", e);
+                    return;
+                }
+
+                logger.warn("Auth grant expired, clearing cache and re-authenticating...");
+
+                // Clear any cache and ignore errors
+                try {
+                    storageManager.cache("");
+                } catch (IOException ignored) {}
+
+                // Clear the auth manager and restart the initialise process
+                authManager = null;
+                initialise(true);
                 return;
             }
 
@@ -120,64 +126,12 @@ public class AuthManager {
         }
     }
 
-    private void loginWithDeviceCode(HttpClient httpClient) throws Exception {
-        // Explicitly define the callback to assist type inference for the generic T
-        Consumer<MsaDeviceCode> deviceCodeCallback = msaDeviceCode -> {
-            logger.info("To sign in, use a web browser to open the page " + msaDeviceCode.getVerificationUri() + " and enter the code " + msaDeviceCode.getUserCode() + " to authenticate.");
-            notificationManager.sendSessionExpiredNotification(msaDeviceCode.getVerificationUri(), msaDeviceCode.getUserCode());
-        };
-
-        authManager = BedrockAuthManager.create(httpClient, Constants.BEDROCK_CODEC.getMinecraftVersion())
-                .login(DeviceCodeMsaAuthService::new, deviceCodeCallback);
-    }
-
-    private void recoverExpiredGrant(HttpClient httpClient, Exception originalError) {
-        logger.warn("Re-auth required: saved Microsoft/Xbox login expired. Sign in again to continue.");
-
-        authManager = null;
-        try {
-            storageManager.cache("");
-        } catch (IOException e) {
-            logger.error("Failed to clear expired auth cache", e);
-        }
-
-        try {
-            loginWithDeviceCode(httpClient);
-            refreshTokens();
-            authManager.getChangeListeners().add((BasicChangeListener) this::saveToCache);
-            saveToCache();
-
-            if (onDeviceTokenRefreshCallback != null) {
-                authManager.getXblDeviceToken().getChangeListeners().add((BasicChangeListener) onDeviceTokenRefreshCallback::run);
-            }
-
-            recoveredExpiredGrant = true;
-        } catch (Exception e) {
-            logger.error("Failed to re-authorize Xbox account after expired login", e);
-            logger.debug("Original expired login error: " + originalError.getMessage());
-        }
-    }
-
-    private boolean isExpiredGrant(Throwable throwable) {
-        Throwable current = throwable;
-        while (current != null) {
-            String message = String.valueOf(current.getMessage()).toLowerCase(Locale.ROOT);
-            if (message.contains("invalid_grant")
-                    || message.contains("grant is expired")
-                    || message.contains("must sign in again")) {
-                return true;
-            }
-            current = current.getCause();
-        }
-        return false;
-    }
-
     private void refreshTokens() throws IOException, AgeVerificationException {
         try {
             // Requesting up-to-date tokens will automatically refresh them if expired
             authManager.getXboxLiveXstsToken().getUpToDate();
             authManager.getPlayFabToken().getUpToDate();
-            profileInfo.getUpToDate();
+            authManager.getXboxUserProfile().getUpToDate();
         } catch (InformativeHttpRequestException e) {
             if (e.getMessage().contains("agecheck")) {
                 throw new AgeVerificationException("Authentication failed due to age verification requirement", e);
@@ -203,10 +157,7 @@ public class AuthManager {
      */
     public BedrockAuthManager getManager() {
         if (authManager == null) {
-            initialise();
-        }
-        if (authManager == null) {
-            throw new IllegalStateException("Authentication is unavailable; retry once network access is restored");
+            initialise(false);
         }
 
         try {
@@ -215,23 +166,17 @@ public class AuthManager {
         } catch (IOException e) {
             logger.error("Failed to refresh tokens", e);
             // Try to re-initialize (force login if refresh failed fatally)
-            initialise();
-            if (authManager == null) {
-                throw new IllegalStateException("Authentication refresh failed; retry once network access is restored", e);
-            }
+            initialise(false);
         }
         return authManager;
     }
 
-    public boolean consumeRecoveredExpiredGrant() {
-        boolean recovered = recoveredExpiredGrant;
-        recoveredExpiredGrant = false;
-        return recovered;
-    }
-
     public String getPlayfabSessionTicket() {
+        if (authManager == null) {
+            initialise(false);
+        }
         try {
-            return getManager().getPlayFabToken().getUpToDate().getSessionTicket();
+            return authManager.getPlayFabToken().getUpToDate().getSessionTicket();
         } catch (IOException e) {
             logger.error("Failed to get PlayFab session ticket", e);
             return null;
@@ -246,7 +191,7 @@ public class AuthManager {
     public void setOnDeviceTokenRefreshCallback(Runnable onDeviceTokenRefreshCallback) {
         this.onDeviceTokenRefreshCallback = onDeviceTokenRefreshCallback;
         if (authManager != null) {
-            authManager.getXblDeviceToken().getChangeListeners().add((BasicChangeListener) onDeviceTokenRefreshCallback::run);
+            authManager.getXblDeviceToken().getChangeListeners().add(onDeviceTokenRefreshCallback::run);
         }
     }
 
@@ -256,8 +201,7 @@ public class AuthManager {
      * @return The Gamertag of the current user
      */
     public String getGamertag() {
-        CachedProfileInfo cachedProfileInfo = profileInfo.getCached();
-        return cachedProfileInfo != null ? cachedProfileInfo.gamertag() : "";
+        return authManager.getXboxUserProfile().getCached().getSettings().get("Gamertag");
     }
 
     /**
@@ -266,7 +210,6 @@ public class AuthManager {
      * @return The XUID of the current user
      */
     public String getXuid() {
-        CachedProfileInfo cachedProfileInfo = profileInfo.getCached();
-        return cachedProfileInfo != null ? cachedProfileInfo.xuid() : "";
+        return authManager.getXboxUserProfile().getCached().getId();
     }
 }
